@@ -205,7 +205,7 @@ class Replica:
 
     def handleGet(self, msg): # handle get messages
         if not self.isLeader() and self.leader != BROADCAST: # if we are not the leader we redirect
-            self.send({'src':self.id, 'dst':msg['src'], 'type':'redirect', 'leader':self.leader, 'MID':msg['MID']})
+            self.send({'src':self.id, 'dst':msg['src'], 'type':'redirect', 'leader': self.leader, 'MID':msg['MID']})
             return
         elif self.isLeader() and self.data[msg['key']]: # if there is a key that exists and we are the leader, we send back an ok and the value
             self.send({'src': self.id, 'dst':msg['src'], 'type':'ok', 'leader': self.leader, 'MID': msg['MID'], "value": self.data[msg['key']]})
