@@ -1,6 +1,7 @@
 # Distributed-Key-Value-Database
 Project 6 CS 3700
 
+Followed and Implemented the Raft Protocol: https://raft.github.io/raft.pdf
 
 Our high level approach for this project was to follow the steps given to us in the project description and break them down into its components and implement slowly. We started by defining the message types we wanted to send to other replicas after reading the raft paper and came up with 4 (other than put and get). These were: appendEntries, appendEntriesResponse, voteRequest, and voteRecieved. Essentially they are just a send/response versions of the append entries RPC and vote request RPCs. We also decided to use threading on this assignment, as we hoped it would improve our performance when we were sending and receiving messages. In all honesty, we are not sure how much it did, but we left it in our final implementation in hopes that it did improve performance. We broke down the assigment into various components, the two most important being the election and handling all of the time requirements, and the other was handling each message that was given to us. This helped us designate blocks of the code to one specific task and helped us when implementing.
 
