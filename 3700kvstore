@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os, random, threading
+
+BROADCAST = 'FFFF'
+
+''' TODO LIST
+Add basic support for responding to client get() and put() requests. At this point, you can respond to all requests with a “type”: “fail” message.
+Implement the Raft election protocol (section 5.2 of the Raft paper); add the ability to respond to get() and put() requests with “type”: “redirect” messages.
+Add a timeout to detect leader failures (i.e., if you dont hear from the leader in X milliseconds…) and make sure that the new election proceeds correctly.
+Implement a basic, empty version of the AppendEntries RPC call that doesnt replicate any data, but acts as a keepalive message from the leader to other replicas to prevent unnecessary elections.
+Implement the transaction log and the “state machine” (i.e., a dictionary containing the key/value pairs from clients, Section 5.3). Dont bother replicating the transactions, just ensure that the leader is able to correctly answer get() and put() requests.
+Improve your AppendEntries RPC call to actually send data to replicas. Ensure that updates are only committing when a quorum is in agreement.
+Add support for retrying failed commits and test it by experimenting with lossy network simulations.
+If you havent already, modify the leader election to support the additional restrictions in Section 5.4.1; test your implementation on lossy networks with failed leaders.
+Implement the subtle commit restriction given in Section 5.4.2.
+Improve your AppendEntries RPC call to implement batching, i.e., a single AppendEntries may send multiple outstanding log entries to a given replica.
+'''
+
+############################ STARTER CODE ############################
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        #Make this a follower initially
+        self.changeToFollower()
+        self.currentTerm = 1 # 1 indexed term 
+        self.leader = BROADCAST # leader 
+
+        # Election related variables
+        self.hasVotedThisTerm = False
+        self.lastTimeout = time.time()
+        self.voters = []
+        self.electionTimeout = random.uniform(.5, 2.0) # Played with the ranges a bit for this and heartbeat timeout, decided to stick with 50 - 200 ms
+        self.heartbeatTimeout = 0.25 # Decided on 25 ms for the final submission
+        self.votesRecieved = 0
+
+        self.specIndex = 0
+        self.loIndex = {} # our list of indexes related to others
+        self.log = [(1,{'INIT':{None:None}})] # 1 indexed log, formatted from raft paper, first is term number, then a dict of MIDS, with a key:value structure.
+        self.data = {} # our data store
+        # Starter code
+
+        #print("Replica %s starting up" % self.id, flush=True)
+        hello = {"src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+        #print("Sent hello message: %s" % hello, flush=True)
+
+    #Starter code
+    def send(self, message):
+        #print("Sent message: %s" % message, flush=True)
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+    ############################ STATE CHANGE METHODS ############################
+
+    #All of these methods are self explanatory, change state methods follow protocol from the raft paper
+
+    def isFollower(self):
+        return self.state == "FOLLOWER"
+
+    def isCandidate(self):
+        return self.state == "CANDIDATE"
+    
+    def isLeader(self):
+        return self.state == "LEADER"
+
+    def changeToFollower(self):
+        #print("Changing to follower: %s" %self.id, flush=True)
+        self.state = "FOLLOWER"
+        self.hasVotedThisTerm = False
+        self.voters = []
+        self.votesRecieved = 0
+        self.resetTimeoutTimer() # reset timeout clock
+    
+    def changeToCandidate(self):
+        #print("Changing to candidate: %s" %self.id, flush=True)
+        self.state = "CANDIDATE"
+        self.hasVotedThisTerm = True
+        self.voters = [self.id]
+        self.votesRecieved = 0
+        self.currentTerm += 1
+        self.votedFor = self.id
+        
+    def changeToLeader(self):
+        #print("Changing to follower: %s" %self.id, flush=True)
+        self.state = "LEADER"
+        self.leader = self.id
+        self.specIndex = len(self.log)
+        self.loIndex = {rep:self.specIndex + 1 for rep in self.others}
+        self.lastHeartbeatHeard = time.time() # makes a heartbeat for our timeout function below
+
+    ############################ TIME/ELECTION METHODS ############################
+
+    def timeoutChecker(self): # Deals with our threading and what to do when heartbeats arent heard, as well as election timeouts
+        while True:
+            currentTime = time.time()
+            if self.isLeader():
+                if currentTime - self.lastHeartbeatHeard > self.heartbeatTimeout: # if our time passed is more than the heatbeat max timeframe 
+                    for num in self.others:
+                        threading.Thread(target=self.appendEntries, kwargs={"dst": num, 'entries':[]}).start() # we send our append entires rpc message to each replica(probably could have made the dst FFFF but did this anyways)
+                    self.lastHeartbeatHeard = time.time() #update our last heartbeat as to not loop 
+            elif currentTime - self.lastTimeout > self.electionTimeout: # if we werent leader, check that the election timer hasnt run out
+                self.changeToCandidate() # if it has, we start the election, and follow raft protocol (turn to candidate, start election etc)
+                for num in self.others: # send our vote requests to all others with the given args
+                    threading.Thread(target=self.requestVotes, args=(self.currentTerm, len(self.log), self.log[-1][0]), kwargs={"dst": num}).start()
+                self.resetTimeoutTimer() # reset the timeout timer once we are done with the election
+
+    # our append entries function, helper to timeoutChecker, used with threading to improve performance
+    def appendEntries(self, entries = [], dst=BROADCAST):
+        if self.loIndex[dst] - 1  < len(self.log): # if our last index was in the log
+            self.currentTerm = self.log[self.loIndex[dst]-1][0] # reassign our term it to the last dst index - 1 term
+        # Send our message with appropriate fields
+        self.send({'src': self.id, 'dst': dst, 'type':'appendEntries', 'leader': self.leader, 'term': self.currentTerm, 'prevLogIndex': self.loIndex[dst] - 1 ,  'prevLogTerm': self.currentTerm, 'entries': entries, 'leaderSpecIdx': self.specIndex})
+
+    def requestVotes(self, term, lastLogIdx, lastLogTerm, dst=BROADCAST):
+        if not self.isLeader(): # as long as we are not a leader yet, we know this is still a candidate, and we send out our vote request with appropriate fields.
+            self.send({'src': self.id, 'dst': dst, 'type':'voteRequest', 'leader': self.leader, 'term': term, 'lastLogIdx': lastLogIdx, 'lastLogTerm': lastLogTerm})
+
+    def resetTimeoutTimer(self):
+        self.electionTimeout = random.uniform(1.5, 3.0) # randomize election timer again, instead to 150-300, which the raft paper recommends? i saw that range somewhere
+        self.lastTimeout = time.time() # update timer 
+
+    ############################ START OF HANDLER METHODS ############################
+
+    def handleAppendEntries(self, msg):# handles AppendEntries
+        # Update from heartbeat
+        self.resetTimeoutTimer() 
+        # Following raft protocol for elections, if we get a term greater than ours, we drop out of the election as it has already finished
+        if self.state == "CANDIDATE" and msg['term'] >= self.currentTerm:
+            self.changeToFollower()
+        # Or we find another leader, we acknowledge them
+        if not self.isLeader() and self.leader != msg['leader']:
+            #print("%s is now leader" % msg['leader'], flush=True)
+            self.leader = msg['leader']
+
+        # Here, if our terms are correct, we send our append response
+        if (msg['term'] < self.currentTerm):
+            self.send({'src': self.id, 'dst': msg['src'], 'type':'appendEntriesResponse', 'leader': self.leader, 'term': self.currentTerm, 'prevLogIndex': len(self.log), 'status': 0})
+            return
+        elif msg['term'] > self.currentTerm: # if our terms are out of order, we go to follower and reset variables according to raft protocol
+            self.changeToFollower()
+            self.currentTerm = msg['term']
+            self.hasVotedThisTerm = False
+        for i in range(len(msg['entries'])): # for each entry,
+            keyLog = [entry[1].keys()[0] for entry in self.log] #get duplicates in our log
+            if msg['entries'][i][1].keys()[0] in keyLog and self.log[keyLog.index(msg['entries'][i][1].keys()[0])][0] != msg['term']:  # if our term numbers dont match and we have matching logs, we 
+                self.log = self.log[:keyLog.index(msg['entries'][i][1].keys()[0])] # delete entry and all following it
+            self.log.append(msg['entries'][i]) #then we append it to the log
+            #print (self.id + ": " +  str(self.log) + '-' + str(leaderSpecIdx) + ' - ' + str(self.specIndex), flush=True)
+            if msg['leaderSpecIdx'] > self.specIndex: # if our leaders index is greater than ours ,we atke the min of the last one recorded and the msg's index
+                self.specIndex = min(msg['leaderSpecIdx'], len(self.log)-1)
+        self.send({'src': self.id, 'dst': msg['src'], 'type':'appendEntriesResponse', 'leader': self.leader, 'term': self.currentTerm, 'prevLogIndex': len(self.log), 'status': 1})
+    
+    def handleAppendEntriesResponse(self, msg): # handles AE responses
+        if self.isLeader():
+            self.loIndex[msg['src']] = msg['prevLogIndex'] + 1 #increment our log of indexes based on the message we received 
+            if msg['status'] == 0: # if our status is 0 
+                entries = self.log[msg['prevLogIndex']+1:msg['prevLogIndex']+10] # Add 10 just to be safe: TODO prob should find a better way to do this, not sure what the purpose of this is
+                threading.Thread(target=self.appendEntries, kwargs={"dst":  msg['src'],'entries':entries}).start() # Send our response messages
+
+
+    def handleVoteRequest(self, msg): # handles vote requests
+        temp = False # condidtions for keeping yourself in the election or not
+        if msg['term'] >= self.currentTerm and msg['lastLogIdx'] >= len(self.log) and msg['lastLogTerm'] >= self.log[-1][0] and not self.hasVotedThisTerm:
+            temp = True
+        if msg['term'] > self.currentTerm: # if our vote is valid or not based on term number
+            self.hasVotedThisTerm = False
+            self.currentTerm = msg['term']
+            self.resetTimeoutTimer()
+        if temp: # send our vote confirmation and go to follower
+            self.send({'src': self.id, 'dst': msg['src'], 'type': 'voteRecieved', 'leader': self.leader, 'term': msg['term'], 'voteGranted': temp})
+            self.changeToFollower()
+            self.hasVotedThisTerm = True
+        else: #TODO fix up logic, code here is repetative and can be cleaned up
+            self.send({'src': self.id, 'dst': msg['src'], 'type': 'voteRecieved', 'leader': self.leader, 'term': msg['term'], 'voteGranted': temp})    
+    
+
+    def handleVote(self, msg): #handles votes 
+        if self.state == "CANDIDATE":
+            self.votesRecieved += 1
+            if msg['voteGranted']: # if this field exists add the id to our voters
+                self.voters.append(msg['src'])
+            if self.votesRecieved - len(self.voters) > math.floor(len(self.others) / 2): #If we didnt get enough votes we go to follower
+                self.changeToFollower()
+            if len(self.voters) > math.floor(len(self.others) / 2): # if we got enough votes we go to leader and send out our appendEntry methods as a leader
+                self.changeToLeader()
+                for replica in self.others:
+                    threading.Thread(target=self.appendEntries, kwargs={"dst": replica, 'entries':[]}).start()
+
+    def handlePut(self, msg): # handles put messages
+        if not self.isLeader() and self.leader != BROADCAST: # if we arent the intended leader, redirect it
+            self.send({'src':self.id, 'dst':msg['src'], 'type':'redirect', 'leader':self.leader, 'MID': msg['MID']})
+            return
+        elif self.isLeader(): # if we are the leader, add it to the log and send back an ok, if not, send a fail
+            self.log.append((self.currentTerm, {msg['MID']:{msg['key']:msg['value']}})) # enters it into our log
+            self.specIndex = len(self.log)
+            self.data[msg['key']] = msg['value'] # send an ok and add it to our data store
+            self.send({'src': self.id, 'dst':msg['src'], 'type':'ok', 'leader': self.leader, 'MID': msg['MID']})
+            return #else send a fail as a last resort
+        self.send({'src': self.id, 'dst':msg['src'], 'type':'fail', 'leader': self.leader, 'MID': msg['MID']})
+
+    def handleGet(self, msg): # handle get messages
+        if not self.isLeader() and self.leader != BROADCAST: # if we are not the leader we redirect
+            self.send({'src':self.id, 'dst':msg['src'], 'type':'redirect', 'leader':self.leader, 'MID':msg['MID']})
+            return
+        elif self.isLeader() and self.data[msg['key']]: # if there is a key that exists and we are the leader, we send back an ok and the value
+            self.send({'src': self.id, 'dst':msg['src'], 'type':'ok', 'leader': self.leader, 'MID': msg['MID'], "value": self.data[msg['key']]})
+            return # if not we send a fail
+        self.send({'src': self.id, 'dst':msg['src'], 'type':'fail', 'leader': self.leader, 'MID': msg['MID']})
+
+    ############################ RUN METHOD ############################
+    
+    def run(self): # We decided to use threading as we believed it would vastly improve performance, lets hope it does and learning it wasnt a massive waste of time :)
+        threading.Thread(target=self.timeoutChecker).start()
+        while True:
+            ready = select.select([self.socket], [], [], 0.1)[0] # used this on advice from piazza, unsure if it does anything still with our implementation 
+            data, addr = self.socket.recvfrom(65535)
+            if len(data) == 0: # if we have no data  to read, loop again until we do
+                continue
+
+            msg = json.loads(data.decode('utf-8')) #json message
+
+            if msg['dst'] != BROADCAST and msg['dst'] != self.id:
+                continue
+            
+            #print("Received message '%s'" % (msg,), flush=True)
+
+            # Delegates to various helper methods based on the type of message we recieved. 
+            # We decied to split them up into 4 catagories, appendEntries, appendEntriesResponse, voteRequest, and voteRecieved, along with the get and put message types.
+
+            #print(msg['type'], flush=True)
+            if msg['type'] == 'appendEntries':
+                self.handleAppendEntries(msg)
+
+            if msg['type'] == 'appendEntriesResponse':
+                self.handleAppendEntriesResponse(msg)
+
+            if msg['type'] == 'voteRequest':
+                self.handleVoteRequest(msg)
+
+            if msg['type'] == 'voteRecieved':
+                self.handleVote(msg)
+
+            if msg['type'] == 'put':
+                self.handlePut(msg)
+
+            if msg['type'] == 'get':
+                self.handleGet(msg)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
